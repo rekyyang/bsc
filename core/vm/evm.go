@@ -17,10 +17,12 @@
 package vm
 
 import (
+	"fmt"
 	"math/big"
 	"sync"
 	"sync/atomic"
 
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/holiman/uint256"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -222,7 +224,9 @@ func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas 
 	if evm.Config.Debug {
 		if evm.depth == 0 {
 			evm.Config.Tracer.CaptureStart(evm, caller.Address(), addr, false, input, gas, value)
+			log.Warn(fmt.Sprintf("debugEvm CaptureStart gas[%d]", gas))
 			defer func(startGas uint64) { // Lazy evaluation of the parameters
+				log.Warn(fmt.Sprintf("debugEvm CaptureEnd startGas[%d], gas[%d]", startGas, gas))
 				evm.Config.Tracer.CaptureEnd(ret, startGas-gas, err)
 			}(gas)
 		} else {
@@ -236,6 +240,7 @@ func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas 
 
 	if isPrecompile {
 		ret, gas, err = RunPrecompiledContract(p, input, gas)
+		log.Warn(fmt.Sprintf("debugEvm precompiled contract gas[%d]", gas))
 	} else {
 		// Initialise a new contract and set the code that is to be used by the EVM.
 		// The contract is a scoped environment for this execution context only.
@@ -250,6 +255,7 @@ func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas 
 			contract.SetCallCode(&addrCopy, evm.StateDB.GetCodeHash(addrCopy), code)
 			ret, err = evm.interpreter.Run(contract, input, false)
 			gas = contract.Gas
+			log.Warn(fmt.Sprintf("debugEvm Contract gas[%d]", gas))
 		}
 	}
 	// When an error was returned by the EVM or when setting the creation code
@@ -264,6 +270,7 @@ func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas 
 		// } else {
 		//	evm.StateDB.DiscardSnapshot(snapshot)
 	}
+	log.Warn(fmt.Sprintf("debugEvm return gas[%d]", gas))
 	return ret, gas, err
 }
 
