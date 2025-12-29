@@ -532,11 +532,11 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
 		}
 	}
 	if it.env != nil && it.env.ResolveBB == nil && cfg != nil {
-		// Build a lightweight resolver using cfg.pcToBlock and cfg.pcToVariants
+		// Build a lightweight resolver using cfg.pcToVariants (Scheme A compatible)
 		// CRITICAL FIX: Context-aware variant selection based on predecessor and parent matching
 		it.env.ResolveBB = func(pc uint64) *MIRBasicBlock {
-			if cfg == nil || cfg.pcToBlock == nil {
-				MirDebugWarn("MIR RunCFGWithResolver: cfg or pcToBlock is nil", "pc", pc)
+			if cfg == nil {
+				MirDebugWarn("MIR RunCFGWithResolver: cfg is nil", "pc", pc)
 				return nil
 			}
 
@@ -552,34 +552,36 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
 					expectedStackSize = len(it.prevBB.ExitStack())
 				}
 
-				for _, variant := range variants {
-					if variant != nil && variant.built {
-						// Get the entry stack size for this variant
-						variantEntrySize := 0
-						if variant.EntryStack() != nil {
-							variantEntrySize = len(variant.EntryStack())
-						}
+				for depth, variant := range variants {
+					if variant == nil || !variant.built {
+						continue
+					}
 
-						// Count PHI operands
-						phiOperandCount := 0
-						for _, instr := range variant.Instructions() {
-							if instr.op == MirPHI && len(instr.operands) > phiOperandCount {
-								phiOperandCount = len(instr.operands)
-							}
-						}
-
-						// Select variant whose entry stack size matches expected size
-						if variantEntrySize == expectedStackSize {
-							bestVariant = variant
-							break // Found matching variant
-						} else if fallbackVariant == nil {
-							// Track first fallback
+					// CanonicalDepth (-1) is used as fallback, prefer real depth variants
+					if depth == CanonicalDepth {
+						if fallbackVariant == nil {
 							fallbackVariant = variant
 						}
+						continue
+					}
+
+					// Get the entry stack size for this variant
+					variantEntrySize := 0
+					if variant.EntryStack() != nil {
+						variantEntrySize = len(variant.EntryStack())
+					}
+
+					// Select variant whose entry stack size matches expected size
+					if variantEntrySize == expectedStackSize {
+						bestVariant = variant
+						break // Found matching variant
+					} else if fallbackVariant == nil {
+						// Track first fallback
+						fallbackVariant = variant
 					}
 				}
 
-				// Use best match or fallback to first built variant
+				// Use best match or fallback
 				selectedVariant := bestVariant
 				if selectedVariant == nil {
 					selectedVariant = fallbackVariant
@@ -590,9 +592,8 @@ func (it *MIRInterpreter) RunCFGWithResolver(cfg *CFG, entry *MIRBasicBlock) ([]
 				}
 			}
 
-			// Fallback to canonical block
-			if bb, ok := cfg.pcToBlock[uint(pc)]; ok {
-				MirDebugWarn("MIR RunCFGWithResolver: found bb", "pc", pc, "bb", bb.blockNum)
+			// Fallback to canonical block using getBlockAtPC (Scheme A compatible)
+			if bb := cfg.getBlockAtPC(uint(pc)); bb != nil {
 				return bb
 			}
 			MirDebugWarn("MIR RunCFGWithResolver: not found bb", "pc", pc)

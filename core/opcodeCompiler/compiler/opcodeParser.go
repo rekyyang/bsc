@@ -8,12 +8,18 @@ import (
 	"github.com/holiman/uint256"
 )
 
+// CanonicalDepth is the depth key used for canonical blocks in pcToVariants.
+// This special value (-1) distinguishes canonical blocks from variant blocks
+// which use actual stack depths (>= 0) as keys.
+// This is part of "Scheme A" - merging pcToBlock into pcToVariants.
+const CanonicalDepth = -1
+
 // scanForBlockStarts scans the bytecode to identify all potential basic block start PCs.
 // Block starts are: PC 0, JUMPDESTs, and instructions immediately following terminators or branches.
 // Also creates the MIRBasicBlock stub for each start PC.
 func (c *CFG) preScanBlocks() error {
 	// Ensure entry block exists
-	if _, ok := c.pcToBlock[0]; !ok {
+	if !c.hasBlockAtPC(0) {
 		c.createBB(0, nil)
 	}
 
@@ -24,7 +30,7 @@ func (c *CFG) preScanBlocks() error {
 
 		// JUMPDEST is always a block start
 		if op == JUMPDEST {
-			if _, ok := c.pcToBlock[uint(i)]; !ok {
+			if !c.hasBlockAtPC(uint(i)) {
 				c.createBB(uint(i), nil)
 			}
 		}
@@ -51,7 +57,7 @@ func (c *CFG) preScanBlocks() error {
 
 		if isTerminatorOrBranch && nextPC < len(code) {
 			// The instruction following a terminator/branch is a block start (fallthrough or dead code entry)
-			if _, ok := c.pcToBlock[uint(nextPC)]; !ok {
+			if !c.hasBlockAtPC(uint(nextPC)) {
 				c.createBB(uint(nextPC), nil)
 			}
 		}
@@ -172,9 +178,9 @@ type CFG struct {
 	memoryAccessor  *MemoryAccessor
 	stateAccessor   *StateAccessor
 	// Fast lookup helpers, built on demand
-	selectorIndex map[uint32]*MIRBasicBlock       // 4-byte selector -> entry basic block
-	pcToBlock     map[uint]*MIRBasicBlock         // bytecode PC -> basic block (canonical)
-	pcToVariants  map[uint]map[int]*MIRBasicBlock // bytecode PC -> stack depth -> variant block
+	selectorIndex map[uint32]*MIRBasicBlock // 4-byte selector -> entry basic block
+	// Scheme A: pcToVariants stores both canonical blocks (at CanonicalDepth=-1) and variant blocks (at actual depth)
+	pcToVariants map[uint]map[int]*MIRBasicBlock // bytecode PC -> stack depth -> basic block
 }
 
 func NewCFG(hash common.Hash, code []byte) (c *CFG) {
@@ -184,17 +190,45 @@ func NewCFG(hash common.Hash, code []byte) (c *CFG) {
 	c.basicBlocks = []*MIRBasicBlock{}
 	c.basicBlockCount = 0
 	c.selectorIndex = nil
-	c.pcToBlock = make(map[uint]*MIRBasicBlock)
+	// Scheme A: only pcToVariants needed (stores canonical at CanonicalDepth and variants at actual depth)
 	c.pcToVariants = make(map[uint]map[int]*MIRBasicBlock)
 	return c
 }
 
 // BlockByPC returns the basic block that owns the given EVM program counter, if known.
 func (c *CFG) BlockByPC(pc uint) *MIRBasicBlock {
-	if c == nil || c.pcToBlock == nil {
+	if c == nil {
 		return nil
 	}
-	return c.pcToBlock[pc]
+	return c.getBlockAtPC(pc)
+}
+
+// getBlockAtPC returns the canonical block at the given PC.
+// Scheme A: reads from pcToVariants[pc][CanonicalDepth].
+func (c *CFG) getBlockAtPC(pc uint) *MIRBasicBlock {
+	if variants := c.pcToVariants[pc]; variants != nil {
+		if bb, ok := variants[CanonicalDepth]; ok {
+			return bb
+		}
+	}
+	return nil
+}
+
+// hasBlockAtPC checks if there is a canonical block at the given PC.
+func (c *CFG) hasBlockAtPC(pc uint) bool {
+	return c.getBlockAtPC(pc) != nil
+}
+
+// getAllCanonicalBlocks returns all canonical blocks (from pcToVariants[CanonicalDepth]).
+// Scheme A: iterates pcToVariants and collects blocks at CanonicalDepth.
+func (c *CFG) getAllCanonicalBlocks() []*MIRBasicBlock {
+	var blocks []*MIRBasicBlock
+	for _, variants := range c.pcToVariants {
+		if bb, ok := variants[CanonicalDepth]; ok && bb != nil {
+			blocks = append(blocks, bb)
+		}
+	}
+	return blocks
 }
 
 func (c *CFG) getMemoryAccessor() *MemoryAccessor {
@@ -219,30 +253,36 @@ func (c *CFG) createEntryBB() *MIRBasicBlock {
 }
 
 // createBB create a normal bb.
+// Scheme A: writes to pcToVariants[pc][CanonicalDepth].
 func (c *CFG) createBB(pc uint, parent *MIRBasicBlock) *MIRBasicBlock {
-	if c.pcToBlock != nil {
-		if existing, ok := c.pcToBlock[pc]; ok {
-			if parent != nil {
-				existing.SetParents([]*MIRBasicBlock{parent})
-			}
-			return existing
+	// Check if already exists
+	if existing := c.getBlockAtPC(pc); existing != nil {
+		if parent != nil {
+			existing.SetParents([]*MIRBasicBlock{parent})
 		}
+		return existing
 	}
+
 	bb := NewMIRBasicBlock(c.basicBlockCount, pc, parent)
 	c.basicBlocks = append(c.basicBlocks, bb)
 	c.basicBlockCount++
-	if c.pcToBlock != nil {
-		c.pcToBlock[pc] = bb
+
+	// Scheme A: write to pcToVariants[pc][CanonicalDepth]
+	if c.pcToVariants[pc] == nil {
+		c.pcToVariants[pc] = make(map[int]*MIRBasicBlock)
 	}
+	c.pcToVariants[pc][CanonicalDepth] = bb
+
 	return bb
 }
 
 // getVariantBlock retrieves or creates a basic block for a specific PC and stack depth.
 // This handles stack polymorphism by creating variant blocks when stack heights differ.
+// Scheme A compatible: uses getBlockAtPC instead of pcToBlock, handles CanonicalDepth.
 func (c *CFG) getVariantBlock(pc uint, depth int, parent *MIRBasicBlock) *MIRBasicBlock {
 	// Ensure canonical block exists (created by preScanBlocks)
-	canonical, ok := c.pcToBlock[pc]
-	if !ok {
+	canonical := c.getBlockAtPC(pc)
+	if canonical == nil {
 		// Should have been created by preScanBlocks, but safe to create if missing
 		canonical = c.createBB(pc, nil)
 	}
@@ -254,7 +294,6 @@ func (c *CFG) getVariantBlock(pc uint, depth int, parent *MIRBasicBlock) *MIRBas
 
 	// Check if a variant for this depth already exists
 	if variant, found := c.pcToVariants[pc][depth]; found {
-
 		if parent != nil {
 			// Add parent linkage if not already present
 			hasParent := false
@@ -272,9 +311,12 @@ func (c *CFG) getVariantBlock(pc uint, depth int, parent *MIRBasicBlock) *MIRBas
 	}
 
 	// No variant for this depth yet.
-	// If no variants exist at all, we can use the canonical block for this depth.
+	// Scheme A: Check if only CanonicalDepth exists (len == 1 with only CanonicalDepth entry).
+	// If so, we can reuse the canonical block for this actual depth.
 	// This ensures that for standard code (single stack height), we reuse the canonical block.
-	if len(c.pcToVariants[pc]) == 0 {
+	onlyCanonicalExists := len(c.pcToVariants[pc]) == 1 && c.pcToVariants[pc][CanonicalDepth] != nil
+	if onlyCanonicalExists {
+		// Reuse canonical block: add reference at actual depth, keep CanonicalDepth as alias
 		c.pcToVariants[pc][depth] = canonical
 		canonical.SetInitDepth(depth)
 
@@ -295,7 +337,7 @@ func (c *CFG) getVariantBlock(pc uint, depth int, parent *MIRBasicBlock) *MIRBas
 	}
 
 	// Canonical is taken by another depth. Create a new variant block.
-	// Use existing createBB logic but don't overwrite pcToBlock
+	// Create a new variant block (don't use createBB to avoid overwriting canonical)
 	variant := NewMIRBasicBlock(c.basicBlockCount, pc, parent)
 	c.basicBlocks = append(c.basicBlocks, variant)
 	c.basicBlockCount++
@@ -314,7 +356,7 @@ func (c *CFG) reachEndBB() {
 
 // preScanBlocks performs a linear scan of the bytecode to identify all potential
 // basic block boundaries (entry, jumpdests, and fallthroughs after terminators/branches).
-// It pre-creates MIRBasicBlock stubs for them in pcToBlock.
+// It pre-creates MIRBasicBlock stubs for them in pcToVariants[CanonicalDepth].
 // (Redundant implementation removed)
 // func (c *CFG) preScanBlocks() { ... }
 
@@ -346,12 +388,14 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 	// Use a worklist to robustly discover all reachable blocks, including those missed by static analysis.
 
 	// Initialize queue with statically reachable blocks
-	queue := make([]*MIRBasicBlock, 0, len(cfg.pcToBlock))
+	// Scheme A: use getAllCanonicalBlocks() instead of pcToBlock
+	canonicalBlocks := cfg.getAllCanonicalBlocks()
+	queue := make([]*MIRBasicBlock, 0, len(canonicalBlocks))
 	inQueue := make(map[*MIRBasicBlock]bool)
 
 	// Sort statically reachable blocks for deterministic initial order
 	var initialBlocks []*MIRBasicBlock
-	for _, bb := range cfg.pcToBlock {
+	for _, bb := range canonicalBlocks {
 		if _, ok := heights[bb]; ok {
 			initialBlocks = append(initialBlocks, bb)
 		}
@@ -463,8 +507,12 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 
 	// Phase 1, Pass 4: Link PHI Operands
 	// Re-collect ALL built blocks
+	// NOTE: Must use getAllCanonicalBlocks(), NOT basicBlocks. Using basicBlocks includes variant blocks
+	// which share the same PC as canonical blocks. Processing them causes PHI operand
+	// conflicts and test failures (e.g., out of gas errors).
+	// Scheme A: use getAllCanonicalBlocks() instead of pcToBlock
 	var bbs []*MIRBasicBlock
-	for _, bb := range cfg.pcToBlock {
+	for _, bb := range cfg.getAllCanonicalBlocks() {
 		if bb.built {
 			bbs = append(bbs, bb)
 		}
@@ -513,6 +561,14 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 					}
 				}
 				phi.operands = append(phi.operands, valPtr)
+			}
+		}
+
+		// DEBUG: Assert PHI operands count matches Parents count
+		for _, phi := range phis {
+			if len(phi.operands) != len(bb.Parents()) {
+				fmt.Printf("[Pass4 PHI MISMATCH] bb=%d pc=%d phi_idx=%d operands=%d parents=%d\n",
+					bb.blockNum, bb.FirstPC(), phi.phiStackIndex, len(phi.operands), len(bb.Parents()))
 			}
 		}
 	}
@@ -638,7 +694,8 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 			if ByteCode(cfg.rawCode[tpc]) != JUMPDEST {
 				continue
 			}
-			targetBB := cfg.pcToBlock[uint(tpc)]
+			// Scheme A: use getBlockAtPC instead of pcToBlock
+			targetBB := cfg.getBlockAtPC(uint(tpc))
 			if targetBB == nil {
 				continue
 			}
@@ -756,7 +813,8 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 	cfg.buildPCIndex()
 	// Always check and fix entry block if PC:2 is JUMPDEST
 	if len(cfg.rawCode) > 2 && ByteCode(cfg.rawCode[2]) == JUMPDEST {
-		// Find the entry block (firstPC == 0) - check both basicBlocks and pcToBlock
+		// Find the entry block (firstPC == 0)
+		// Scheme A: use getBlockAtPC instead of pcToBlock
 		var entryBB *MIRBasicBlock
 		for _, bb := range cfg.basicBlocks {
 			if bb != nil && bb.FirstPC() == 0 {
@@ -765,9 +823,9 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 			}
 		}
 		if entryBB == nil {
-			entryBB = cfg.pcToBlock[0]
+			entryBB = cfg.getBlockAtPC(0)
 		}
-		loopBB := cfg.pcToBlock[2]
+		loopBB := cfg.getBlockAtPC(2)
 		if entryBB != nil && entryBB.FirstPC() == 0 && loopBB != nil {
 			// If entry block has no instructions, rebuild it to ensure it has PUSH1
 			if entryBB.Size() == 0 {
@@ -846,18 +904,11 @@ func (c *CFG) GetBasicBlocks() []*MIRBasicBlock {
 }
 
 // buildPCIndex builds a map from PC to basic block for quick lookups.
+// Scheme A: this is now a no-op since we use pcToVariants[CanonicalDepth] directly.
+// Kept for backward compatibility with existing code paths.
 func (c *CFG) buildPCIndex() {
-	if c.pcToBlock != nil {
-		return
-	}
-	m := make(map[uint]*MIRBasicBlock, len(c.basicBlocks))
-	for _, bb := range c.basicBlocks {
-		if bb == nil {
-			continue
-		}
-		m[bb.FirstPC()] = bb
-	}
-	c.pcToBlock = m
+	// Scheme A: pcToVariants[CanonicalDepth] is already populated by createBB.
+	// This function is now a no-op but kept for API compatibility.
 }
 
 // EnsureSelectorIndexBuilt scans raw bytecode for PUSH4 <selector> and a nearby
@@ -875,7 +926,8 @@ func (c *CFG) EnsureSelectorIndexBuilt() {
 			for j := i + 5; j < i+12 && j+2 < len(code); j++ {
 				if code[j] == 0x61 { // PUSH2
 					off := (uint(code[j+1]) << 8) | uint(code[j+2])
-					if bb, ok := c.pcToBlock[uint(off)]; ok {
+					// Scheme A: use getBlockAtPC instead of pcToBlock
+					if bb := c.getBlockAtPC(uint(off)); bb != nil {
 						if _, exists := idx[sel]; !exists {
 							idx[sel] = bb
 						}
@@ -1584,7 +1636,8 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 
 							// Ensure the linear fallthrough block (i+1) is created and queued for processing
 							// (omitting parent linkage)
-							if _, ok := c.pcToBlock[uint(i+1)]; !ok {
+							// Scheme A: use hasBlockAtPC instead of pcToBlock
+							if !c.hasBlockAtPC(uint(i + 1)) {
 								// We use createBB here because it's not a CFG edge, just ensuring existence
 								fall := c.createBB(uint(i+1), nil)
 								if !fall.queued {
@@ -1789,10 +1842,12 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 					if d.IsConst() && targetPC < uint64(len(code)) {
 						isJumpdest := ByteCode(code[targetPC]) == JUMPDEST
 						// Determine existence and whether either edge is newly added
+						// Scheme A: use getBlockAtPC instead of pcToBlock
 						var hadTargetParentBefore bool
 						var hadFallParentBefore bool
-						existingTarget, targetExists := c.pcToBlock[uint(targetPC)]
-						if targetExists && existingTarget != nil {
+						existingTarget := c.getBlockAtPC(uint(targetPC))
+						targetExists := existingTarget != nil
+						if targetExists {
 							for _, p := range existingTarget.Parents() {
 								if p == curBB {
 									hadTargetParentBefore = true
@@ -1800,8 +1855,9 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 								}
 							}
 						}
-						existingFall, fallExists := c.pcToBlock[uint(i+1)]
-						if fallExists && existingFall != nil {
+						existingFall := c.getBlockAtPC(uint(i + 1))
+						fallExists := existingFall != nil
+						if fallExists {
 							for _, p := range existingFall.Parents() {
 								if p == curBB {
 									hadFallParentBefore = true

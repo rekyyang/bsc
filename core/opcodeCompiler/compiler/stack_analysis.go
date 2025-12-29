@@ -10,7 +10,8 @@ import (
 func (c *CFG) analyzeStackHeights() (map[*MIRBasicBlock]int, error) {
 	heights := make(map[*MIRBasicBlock]int)
 	// Entry block starts with height 0
-	entryBB := c.pcToBlock[0]
+	// Scheme A: use getBlockAtPC instead of pcToBlock
+	entryBB := c.getBlockAtPC(0)
 	if entryBB == nil {
 		// If no block at 0, maybe empty code?
 		if len(c.rawCode) == 0 {
@@ -101,8 +102,9 @@ func (c *CFG) calculateBlockStackInfo(bb *MIRBasicBlock) (delta int, maxPop int,
 
 	for pc < len(code) {
 		// If we crossed into another block, stop (unless it's the start of this block)
+		// Scheme A: use hasBlockAtPC instead of pcToBlock
 		if pc > int(bb.firstPC) {
-			if _, isStart := c.pcToBlock[uint(pc)]; isStart {
+			if c.hasBlockAtPC(uint(pc)) {
 				// Block boundary reached (fallthrough case)
 				// lastOp should be the previous op. But we don't track it easily here.
 				// However, calculateBlockStackInfo is supposed to return info for *this* block 'bb'.
@@ -206,10 +208,11 @@ func (c *CFG) getSuccessors(bb *MIRBasicBlock, lastOp ByteCode, stopPC int) []*M
 	}
 
 	// 1. JUMP
+	// Scheme A: use getBlockAtPC instead of pcToBlock
 	if lastOp == JUMP {
 		dest := resolvePush(stopPC)
 		if dest >= 0 {
-			if target, ok := c.pcToBlock[uint(dest)]; ok {
+			if target := c.getBlockAtPC(uint(dest)); target != nil {
 				succs = append(succs, target)
 			}
 		}
@@ -221,14 +224,14 @@ func (c *CFG) getSuccessors(bb *MIRBasicBlock, lastOp ByteCode, stopPC int) []*M
 		// True branch
 		dest := resolvePush(stopPC)
 		if dest >= 0 {
-			if target, ok := c.pcToBlock[uint(dest)]; ok {
+			if target := c.getBlockAtPC(uint(dest)); target != nil {
 				succs = append(succs, target)
 			}
 		}
 		// False branch (fallthrough)
 		// Logic: code[stopPC] is JUMPI (1 byte). Next is stopPC+1.
 		fallthroughPC := stopPC + 1
-		if target, ok := c.pcToBlock[uint(fallthroughPC)]; ok {
+		if target := c.getBlockAtPC(uint(fallthroughPC)); target != nil {
 			succs = append(succs, target)
 		}
 		return succs
@@ -251,7 +254,7 @@ func (c *CFG) getSuccessors(bb *MIRBasicBlock, lastOp ByteCode, stopPC int) []*M
 		nextPC += int(lastOp - PUSH1 + 1)
 	}
 
-	if target, ok := c.pcToBlock[uint(nextPC)]; ok {
+	if target := c.getBlockAtPC(uint(nextPC)); target != nil {
 		succs = append(succs, target)
 	}
 
