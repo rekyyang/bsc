@@ -582,10 +582,6 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 			}
 			// Skip if already has children (resolved during build)
 			//if len(bb.Children()) > 0 {
-			//if bb.FirstPC() == 2980 {
-			//	fmt.Println("debug xx", bb.Instructions()[len(bb.Instructions())-1].operands[0].PrintAllKonst())
-			//	fmt.Println()
-			//}
 			//	continue
 			//}
 			// Check if JUMP target is PHI-based
