@@ -651,7 +651,12 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 				if ByteCode(cfg.rawCode[tpc]) != JUMPDEST {
 					continue
 				}
-				targetBB := cfg.pcToBlock[uint(tpc)]
+				var targetBB *MIRBasicBlock
+				if bb.ExitStack() == nil {
+					targetBB = cfg.pcToBlock[uint(tpc)]
+				} else {
+					targetBB = cfg.getVariantBlock(uint(tpc), len(bb.ExitStack()), bb)
+				}
 				if targetBB == nil {
 					continue
 				}
@@ -2643,8 +2648,8 @@ func (c *CFG) PrintCFGTopology() string {
 	})
 
 	for _, n := range sortedNodes {
-		label := fmt.Sprintf("BB%d\\nPC:%d..%d\\nparents:%d children:%d\\nins:%d",
-			n.blockNum, n.firstPC, n.lastPC, len(n.parents), len(n.children), len(n.Instructions()))
+		label := fmt.Sprintf("BB%d\\nPC:%d..%d\\nparents:%d children:%d\\nins:%d entryStk: %d, exitStk: %d",
+			n.blockNum, n.firstPC, n.lastPC, len(n.parents), len(n.children), len(n.Instructions()), len(n.EntryStack()), len(n.ExitStack()))
 		buf.WriteString(fmt.Sprintf("  \"BB_%d\" [label=\"%s\"];\n", n.blockNum, label))
 	}
 
