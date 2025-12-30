@@ -551,11 +551,15 @@ func (cfg *CFG) buildUnbuiltBlocks(memoryAccessor *MemoryAccessor, stateAccessor
 			continue
 		}
 
-		// Derive stack height from incoming stacks
-		var h int
-		for _, stack := range incoming {
-			h = len(stack)
-			break
+		// Use InitDepth if set (from getVariantBlock), otherwise derive from incoming stacks
+		// This ensures stack-polymorphic blocks use their designated depth
+		h := bb.InitDepth()
+		if h <= 0 {
+			// Fallback: derive from incoming stacks (for non-variant blocks)
+			for _, stack := range incoming {
+				h = len(stack)
+				break
+			}
 		}
 
 		// Create entry stack with PHIs if not already set
@@ -751,19 +755,25 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 		if bb.EntryStack() == nil {
 			_, hasStaticHeight := heights[bb]
 			if !hasStaticHeight {
-				incoming := bb.IncomingStacks()
-				if len(incoming) > 0 {
-					var parents []*MIRBasicBlock
-					for p := range incoming {
-						parents = append(parents, p)
-					}
-					sort.Slice(parents, func(i, j int) bool {
-						return parents[i].FirstPC() < parents[j].FirstPC()
-					})
-					parentStack := incoming[parents[0]]
-					heights[bb] = len(parentStack)
+				// Priority 1: Use InitDepth if set (from getVariantBlock)
+				if bb.InitDepth() > 0 {
+					heights[bb] = bb.InitDepth()
 				} else {
-					continue
+					// Priority 2: Derive from incoming stacks
+					incoming := bb.IncomingStacks()
+					if len(incoming) > 0 {
+						var parents []*MIRBasicBlock
+						for p := range incoming {
+							parents = append(parents, p)
+						}
+						sort.Slice(parents, func(i, j int) bool {
+							return parents[i].FirstPC() < parents[j].FirstPC()
+						})
+						parentStack := incoming[parents[0]]
+						heights[bb] = len(parentStack)
+					} else {
+						continue
+					}
 				}
 			}
 		}
@@ -789,6 +799,11 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 				currentEVMBuildPC = bb.FirstPC()
 				currentEVMBuildOp = 0
 				bb.appendMIR(phi)
+
+				// Debug log for block 142 PHI creation
+				if bb.FirstPC() == 2643 && bb.BlockNum() == 142 {
+					MirDebugWarn("  Creating PHI for block 142", "i", i, "phiStackIndex", h-1-i, "instrCount", len(bb.Instructions()))
+				}
 
 				val := Value{
 					kind:   Variable,
@@ -1072,19 +1087,26 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 			if len(ops) > 0 {
 				base := ops[0]
 				if base != nil && base.kind != Unknown {
+					// CRITICAL FIX: Don't simplify PHI-derived values from different parents,
+					// because their runtime values may differ even if their defs are structurally equal.
+					// This is essential for stack-polymorphic blocks with multiple variant parents.
+					hasPHIDef := base.def != nil && base.def.op == MirPHI
 					equalAll := true
 					for k := 1; k < len(ops); k++ {
 						if ops[k] == nil || ops[k].kind == Unknown || !equalValueForFlow(base, ops[k]) {
 							equalAll = false
 							break
 						}
+						// Also check if any operand is PHI-derived
+						if ops[k].def != nil && ops[k].def.op == MirPHI {
+							hasPHIDef = true
+						}
 					}
-					if equalAll {
+					// Don't simplify if any operand comes from a PHI (runtime-dependent value)
+					if equalAll && !hasPHIDef {
 						// Push the representative value and continue
 						tmp.push(base)
 						simplified = true
-						// Optional debug
-
 					}
 				}
 			}
@@ -1126,15 +1148,20 @@ func (c *CFG) buildBasicBlock(curBB *MIRBasicBlock, valueStack *ValueStack, memo
 				}
 			} else {
 				// If only one operand after dedup, avoid creating PHI
+				// CRITICAL FIX: Even if dedup reduced to 1 operand, we still need PHI
+				// for values from PHI definitions (runtime-dependent)
 				if len(ops) == 1 {
-					tmp.push(ops[0])
-
-					continue
+					op := ops[0]
+					hasPHIDef := op != nil && op.def != nil && op.def.op == MirPHI
+					if !hasPHIDef {
+						tmp.push(ops[0])
+						continue
+					}
+					// Fall through to create PHI even with 1 operand if it's PHI-derived
 				}
 				phi := curBB.CreatePhiMIR(ops, &tmp)
 				if phi != nil {
 					phi.phiStackIndex = i
-
 				}
 			}
 		}

@@ -311,10 +311,6 @@ func (it *MIRInterpreter) GetEnv() *MIRExecutionEnv {
 // RunMIR executes all instructions in the given basic block list sequentially.
 // For now, control-flow is assumed to be linear within a basic block.
 func (it *MIRInterpreter) RunMIR(block *MIRBasicBlock) ([]byte, error) {
-	MirDebugWarn("MIR RunMIR: block", "block", block.blockNum, "instructions", len(block.instructions))
-	for i, ins := range block.instructions {
-		MirDebugWarn("MIR instruction", "idx", i, "op", ins.op)
-	}
 	if block == nil || len(block.instructions) == 0 {
 		return it.returndata, nil
 	}
@@ -1240,6 +1236,11 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 		}
 		key := it.evalValue(m.operands[0])
 		val := it.sload(key)
+		MirDebugWarn("mirHandleSLOAD",
+			"evmPC", m.evmPC,
+			"key", key.Hex(),
+			"val", val.Hex(),
+		)
 		it.setResult(m, val)
 		return nil
 	case MirSSTORE:
@@ -1612,6 +1613,7 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 
 	// Hashing (placeholder: full keccak over memory slice)
 	case MirKECCAK256:
+		MirDebugWarn("mirHandleKECCAK256 ENTER", "evmPC", m.evmPC)
 		if len(m.operands) < 2 {
 			return fmt.Errorf("KECCAK256 missing operands")
 		}
@@ -1633,6 +1635,13 @@ func (it *MIRInterpreter) exec(m *MIR) error {
 			mirKeccakHook(off.Uint64(), sz.Uint64(), append([]byte(nil), b...))
 		}
 		h := crypto.Keccak256(b)
+		MirDebugWarn("mirHandleKECCAK256 DONE",
+			"evmPC", m.evmPC,
+			"off", off.Uint64(),
+			"sz", sz.Uint64(),
+			"input", fmt.Sprintf("%x", b),
+			"hash", fmt.Sprintf("%x", h),
+		)
 		it.setResult(m, it.tmpA.Clear().SetBytes(h))
 		return nil
 	case MirLOG0, MirLOG1, MirLOG2, MirLOG3, MirLOG4:
@@ -2201,15 +2210,46 @@ func mirHandlePHI(it *MIRInterpreter, m *MIR) error {
 			// Use phiPredDepth for stack-polymorphic resolution if available
 			// This handles cases where the predecessor has a different stack depth than expected
 			useDepth := len(exit)
+			linkDepthFound := false
 			if m.phiPredDepth != nil {
 				if linkDepth, ok := m.phiPredDepth[it.prevBB]; ok && linkDepth > 0 {
 					// Use the depth recorded at link time for this predecessor
 					// This ensures we get the correct stack position even if depths differ
 					useDepth = linkDepth
+					linkDepthFound = true
 				}
 			}
 
 			idxFromTop := m.phiStackIndex
+			// Debug: log key PHI resolution details for critical PHIs
+			if m.evmPC == 2643 {
+				MirDebugWarn("mirHandlePHI DEBUG",
+					"evmPC", m.evmPC,
+					"phiStackIndex", idxFromTop,
+					"len(exit)", len(exit),
+					"useDepth", useDepth,
+					"linkDepthFound", linkDepthFound,
+					"prevBB_firstPC", it.prevBB.FirstPC(),
+				)
+				// Also log the exit stack values
+				for i := range exit {
+					v := &exit[i]
+					valStr := "nil"
+					kindStr := fmt.Sprintf("%d", v.kind)
+					defPC := uint(0)
+					if v.def != nil {
+						defPC = v.def.evmPC
+					}
+					// Try to get the actual value
+					vCopy := *v
+					vCopy.liveIn = true
+					actualVal := it.evalValue(&vCopy)
+					if actualVal != nil {
+						valStr = actualVal.Hex()
+					}
+					MirDebugWarn("  exit_stack", "idx", i, "kind", kindStr, "def_evmPC", defPC, "val", valStr)
+				}
+			}
 			if idxFromTop < useDepth && idxFromTop < len(exit) {
 				// Map PHI slot (0=top) to index in exit snapshot
 				// Use useDepth to calculate the base, but bound by actual exit length
@@ -2220,6 +2260,15 @@ func mirHandlePHI(it *MIRInterpreter, m *MIR) error {
 					src.liveIn = true
 
 					val := it.evalValue(&src)
+					if m.evmPC == 2643 {
+						MirDebugWarn("mirHandlePHI DEBUG resolved",
+							"evmPC", m.evmPC,
+							"pos", pos,
+							"val", val.Hex(),
+							"src_kind", src.kind,
+							"src_def_evmPC", func() uint { if src.def != nil { return src.def.evmPC }; return 0 }(),
+						)
+					}
 					it.setResult(m, val)
 					// Record PHI result with predecessor sensitivity for future uses
 					if m != nil {
@@ -2259,6 +2308,14 @@ func mirHandlePHI(it *MIRInterpreter, m *MIR) error {
 						src := stack[len(stack)-1-idxFromTop]
 						src.liveIn = true
 						val := it.evalValue(&src)
+						if m.evmPC == 2643 {
+							MirDebugWarn("mirHandlePHI DEBUG via incoming stacks",
+								"evmPC", m.evmPC,
+								"idxFromTop", idxFromTop,
+								"val", val.Hex(),
+								"src_kind", src.kind,
+							)
+						}
 						it.setResult(m, val)
 						if m != nil && val != nil {
 							if it.phiResults[m] == nil {
@@ -2274,6 +2331,13 @@ func mirHandlePHI(it *MIRInterpreter, m *MIR) error {
 		}
 	}
 	// Fallback: pick operand corresponding to predecessor position among parents
+	if m.evmPC == 2643 {
+		MirDebugWarn("mirHandlePHI DEBUG fallback to operands",
+			"evmPC", m.evmPC,
+			"len(operands)", len(m.operands),
+			"prevBB_nil", it.prevBB == nil,
+		)
+	}
 	if len(m.operands) == 0 {
 		it.setResult(m, it.zeroConst)
 		return nil
@@ -2438,7 +2502,28 @@ func mirHandleAND(it *MIRInterpreter, m *MIR) error {
 	if err != nil {
 		return err
 	}
-	it.setResult(m, it.tmpA.Clear().And(a, b))
+	result := it.tmpA.Clear().And(a, b)
+	// Debug AND in the critical region
+	if m.evmPC >= 2680 && m.evmPC <= 2700 && len(m.operands) >= 2 {
+		op0, op1 := m.operands[0], m.operands[1]
+		MirDebugWarn("mirHandleAND",
+			"evmPC", m.evmPC,
+			"a", a.Hex(),
+			"b", b.Hex(),
+			"result", result.Hex(),
+			"op0_kind", op0.kind,
+			"op0_liveIn", op0.liveIn,
+			"op0_def_evmPC", func() uint { if op0.def != nil { return op0.def.evmPC }; return 0 }(),
+			"op0_def_op", func() string { if op0.def != nil { return op0.def.op.String() }; return "nil" }(),
+			"op0_def_idx", func() int { if op0.def != nil { return op0.def.idx }; return -1 }(),
+			"op0_def_phiStackIndex", func() int { if op0.def != nil { return op0.def.phiStackIndex }; return -1 }(),
+			"op1_kind", op1.kind,
+			"op1_liveIn", op1.liveIn,
+			"op1_def_evmPC", func() uint { if op1.def != nil { return op1.def.evmPC }; return 0 }(),
+			"op1_def_op", func() string { if op1.def != nil { return op1.def.op.String() }; return "nil" }(),
+		)
+	}
+	it.setResult(m, result)
 	return nil
 }
 func mirHandleOR(it *MIRInterpreter, m *MIR) error {
@@ -2573,6 +2658,21 @@ func mirHandleMSTORE(it *MIRInterpreter, m *MIR) error {
 	} else {
 		val = it.evalValue(m.operands[2])
 	}
+	// Debug log for MSTORE operations in the critical region (evmPC around 2680-2700)
+	if m.evmPC >= 2680 && m.evmPC <= 2700 {
+		// Log operand details to trace value source
+		op2 := m.operands[2]
+		MirDebugWarn("mirHandleMSTORE",
+			"evmPC", m.evmPC,
+			"off", off.Uint64(),
+			"val", val.Hex(),
+			"op2_kind", op2.kind,
+			"op2_liveIn", op2.liveIn,
+			"op2_def_evmPC", func() uint { if op2.def != nil { return op2.def.evmPC }; return 0 }(),
+			"op2_def_op", func() string { if op2.def != nil { return op2.def.op.String() }; return "nil" }(),
+			"op2_def_phiStackIndex", func() int { if op2.def != nil { return op2.def.phiStackIndex }; return -1 }(),
+		)
+	}
 	it.writeMem32(off, val)
 	return nil
 }
@@ -2677,6 +2777,7 @@ func mirHandleKECCAK(it *MIRInterpreter, m *MIR) error {
 	} else {
 		sz = it.evalValue(m.operands[1])
 	}
+	MirDebugWarn("mirHandleKECCAK ENTER", "evmPC", m.evmPC, "off", off.Uint64(), "sz", sz.Uint64())
 	// Fast-path: empty input
 	if sz.IsZero() {
 		// keccak256("") constant without allocating
@@ -2708,6 +2809,11 @@ func mirHandleKECCAK(it *MIRInterpreter, m *MIR) error {
 	}
 	_, _ = it.hasher.Write(bytesToHash)
 	_, _ = it.hasher.Read(it.hasherBuf[:])
+	MirDebugWarn("mirHandleKECCAK DONE",
+		"evmPC", m.evmPC,
+		"input", fmt.Sprintf("%x", bytesToHash),
+		"hash", fmt.Sprintf("%x", it.hasherBuf[:]),
+	)
 	it.setResult(m, it.tmpA.Clear().SetBytes(it.hasherBuf[:]))
 	return nil
 }
@@ -2910,18 +3016,38 @@ func (it *MIRInterpreter) evalValue(v *Value) (ret *uint256.Int) {
 		if v.def != nil {
 			// For PHI definitions, prefer predecessor-sensitive cache
 			if v.def.op == MirPHI {
+				// Debug: track PHI value lookup for evmPC=2643
+				if v.def.evmPC == 2643 {
+					MirDebugWarn("evalValue PHI lookup",
+						"evmPC", v.def.evmPC,
+						"prevBB_firstPC", func() uint { if it.prevBB != nil { return it.prevBB.FirstPC() }; return 0 }(),
+						"phiResults_has_def", it.phiResults[v.def] != nil,
+					)
+				}
 				// Use last known predecessor for this PHI if available, else immediate prevBB
 				if it.phiResults != nil {
 					// Prefer exact predecessor mapping
 					if preds, ok := it.phiResults[v.def]; ok {
 						if it.prevBB != nil {
 							if val, ok2 := preds[it.prevBB]; ok2 && val != nil {
+								if v.def.evmPC == 2643 {
+									MirDebugWarn("evalValue PHI cache hit",
+										"evmPC", v.def.evmPC,
+										"val", val.Hex(),
+									)
+								}
 								return val
 							}
 						}
 						// Fallback to last predecessor observed for this PHI
 						if last := it.phiLastPred[v.def]; last != nil {
 							if val, ok2 := preds[last]; ok2 && val != nil {
+								if v.def.evmPC == 2643 {
+									MirDebugWarn("evalValue PHI cache hit (last pred)",
+										"evmPC", v.def.evmPC,
+										"val", val.Hex(),
+									)
+								}
 								return val
 							}
 						}

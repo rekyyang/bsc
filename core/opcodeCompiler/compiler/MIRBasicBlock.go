@@ -447,6 +447,30 @@ func (b *MIRBasicBlock) CreateDupMIR(n int, stack *ValueStack) *MIR {
 
 	// Get the value to duplicate (n-1 because stack is 0-indexed from top)
 	dupValue := stack.peek(n - 1)
+	
+	// Debug log for DUP7 at evmPC=2681
+	if currentEVMBuildPC == 2681 && n == 7 {
+		MirDebugWarn("CreateDupMIR DUP7",
+			"evmPC", currentEVMBuildPC,
+			"n", n,
+			"stack_size", stack.size(),
+			"dupValue_kind", func() int { if dupValue != nil { return int(dupValue.kind) }; return -1 }(),
+			"dupValue_def_evmPC", func() uint { if dupValue != nil && dupValue.def != nil { return dupValue.def.evmPC }; return 0 }(),
+			"dupValue_def_phiStackIndex", func() int { if dupValue != nil && dupValue.def != nil { return dupValue.def.phiStackIndex }; return -1 }(),
+		)
+		// Also log the stack contents for debugging
+		for i := 0; i < min(10, stack.size()); i++ {
+			v := stack.peek(i)
+			if v != nil {
+				MirDebugWarn("  DUP7 stack",
+					"idx_from_top", i,
+					"kind", v.kind,
+					"def_evmPC", func() uint { if v.def != nil { return v.def.evmPC }; return 0 }(),
+					"def_phiStackIndex", func() int { if v.def != nil { return v.def.phiStackIndex }; return -1 }(),
+				)
+			}
+		}
+	}
 
 	// Check if we can optimize this DUP operation
 	if isOptimizable(MirOperation(0x80+byte(n-1))) && dupValue.kind == Konst {
