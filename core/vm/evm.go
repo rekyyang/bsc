@@ -292,7 +292,7 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 				if evm.mirInterpreter == nil {
 					return nil, gas, fmt.Errorf("MIR enabled but mirInterpreter is nil")
 				}
-				contract.SetCallCode(codeHash, code)
+				contract.SetCallCode(&addrCopy, codeHash, code)
 				ret, err = evm.mirInterpreter.Run(contract, input, false)
 			} else if evm.Config.EnableOpcodeOptimizations {
 				contract.optimized, code = tryGetOptimizedCode(evm, codeHash, code)
@@ -303,11 +303,11 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 				} else {
 					evm.UseBaseInterpreter()
 				}
-				contract.SetCallCode(codeHash, code)
+				contract.SetCallCode(&addrCopy, codeHash, code)
 				ret, err = evm.interpreter.Run(contract, input, false)
 			} else {
 				evm.UseBaseInterpreter()
-				contract.SetCallCode(evm.resolveCodeHash(addr), code)
+				contract.SetCallCode(&addrCopy, evm.resolveCodeHash(addr), code)
 				ret, err = evm.interpreter.Run(contract, input, false)
 			}
 			contract.IsSystemCall = isSystemCall(caller)
@@ -381,11 +381,11 @@ func (evm *EVM) CallCode(caller common.Address, addr common.Address, input []byt
 			if evm.mirInterpreter == nil {
 				return nil, gas, fmt.Errorf("MIR enabled but mirInterpreter is nil")
 			}
-			contract.SetCallCode(codeHash, code)
+			contract.SetCallCode(&addrCopy, codeHash, code)
 			ret, err = evm.mirInterpreter.Run(contract, input, false)
 		} else if evm.Config.EnableOpcodeOptimizations {
 			contract.optimized, code = tryGetOptimizedCode(evm, codeHash, code)
-			contract.SetCallCode(codeHash, code)
+			contract.SetCallCode(&addrCopy, codeHash, code)
 
 			if contract.optimized {
 				evm.UseOptInterpreter()
@@ -395,7 +395,7 @@ func (evm *EVM) CallCode(caller common.Address, addr common.Address, input []byt
 			}
 			ret, err = evm.interpreter.Run(contract, input, false)
 		} else {
-			contract.SetCallCode(evm.resolveCodeHash(addr), evm.resolveCode(addr))
+			contract.SetCallCode(&addrCopy, evm.resolveCodeHash(addr), evm.resolveCode(addr))
 			ret, err = evm.interpreter.Run(contract, input, false)
 		}
 		gas = contract.Gas
@@ -452,11 +452,11 @@ func (evm *EVM) DelegateCall(originCaller common.Address, caller common.Address,
 			if evm.mirInterpreter == nil {
 				return nil, gas, fmt.Errorf("MIR enabled but mirInterpreter is nil")
 			}
-			contract.SetCallCode(codeHash, code)
+			contract.SetCallCode(&addrCopy, codeHash, code)
 			ret, err = evm.mirInterpreter.Run(contract, input, false)
 		} else if evm.Config.EnableOpcodeOptimizations {
 			contract.optimized, code = tryGetOptimizedCode(evm, codeHash, code)
-			contract.SetCallCode(codeHash, code)
+			contract.SetCallCode(&addrCopy, codeHash, code)
 			if contract.optimized {
 				evm.UseOptInterpreter()
 				contract.codeBitmapFunc = codeBitmapWhitSI
@@ -465,7 +465,7 @@ func (evm *EVM) DelegateCall(originCaller common.Address, caller common.Address,
 			}
 			ret, err = evm.interpreter.Run(contract, input, false)
 		} else {
-			contract.SetCallCode(evm.resolveCodeHash(addr), evm.resolveCode(addr))
+			contract.SetCallCode(&addrCopy, evm.resolveCodeHash(addr), evm.resolveCode(addr))
 			ret, err = evm.interpreter.Run(contract, input, false)
 		}
 		gas = contract.Gas
@@ -533,7 +533,7 @@ func (evm *EVM) StaticCall(caller common.Address, addr common.Address, input []b
 			if evm.mirInterpreter == nil {
 				return nil, gas, fmt.Errorf("MIR enabled but mirInterpreter is nil")
 			}
-			contract.SetCallCode(codeHash, code)
+			contract.SetCallCode(&addrCopy, codeHash, code)
 			ret, err = evm.mirInterpreter.Run(contract, input, true)
 		} else if evm.Config.EnableOpcodeOptimizations {
 			contract.optimized, code = tryGetOptimizedCode(evm, codeHash, code)
@@ -543,13 +543,13 @@ func (evm *EVM) StaticCall(caller common.Address, addr common.Address, input []b
 			} else {
 				evm.UseBaseInterpreter()
 			}
-			contract.SetCallCode(codeHash, code)
+			contract.SetCallCode(&addrCopy, codeHash, code)
 			// When an error was returned by the EVM or when setting the creation code
 			// above we revert to the snapshot and consume any gas remaining. Additionally
 			// when we're in Homestead this also counts for code storage gas errors.
 			ret, err = evm.interpreter.Run(contract, input, true)
 		} else {
-			contract.SetCallCode(evm.resolveCodeHash(addr), evm.resolveCode(addr))
+			contract.SetCallCode(&addrCopy, evm.resolveCodeHash(addr), evm.resolveCode(addr))
 			// When an error was returned by the EVM or when setting the creation code
 			// above we revert to the snapshot and consume any gas remaining. Additionally
 			// when we're in Homestead this also counts for code storage gas errors.
