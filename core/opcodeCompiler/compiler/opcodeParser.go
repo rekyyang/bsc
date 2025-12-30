@@ -365,6 +365,7 @@ func (c *CFG) reachEndBB() {
 // linkPhiOperandsForBlock links PHI operands for a single block.
 // Uses SortedParents() for deterministic ordering.
 // This function is idempotent - it clears existing operands before relinking.
+// Also populates phiPredDepth for stack-polymorphic PHI resolution.
 func (cfg *CFG) linkPhiOperandsForBlock(bb *MIRBasicBlock) {
 	if len(bb.Parents()) == 0 {
 		return
@@ -382,15 +383,20 @@ func (cfg *CFG) linkPhiOperandsForBlock(bb *MIRBasicBlock) {
 		return
 	}
 
-	// Clear existing operands (idempotent)
+	// Clear existing operands and phiPredDepth (idempotent)
 	for _, phi := range phis {
 		phi.operands = nil
+		phi.phiPredDepth = make(map[*MIRBasicBlock]int)
 	}
 
 	// Link operands using sorted parents for determinism
 	sortedParents := bb.SortedParents()
 	for _, parent := range sortedParents {
 		ps := parent.ExitStack()
+		exitDepth := 0
+		if ps != nil {
+			exitDepth = len(ps)
+		}
 		for idx, phi := range phis {
 			var valPtr *Value
 			if ps != nil {
@@ -401,7 +407,11 @@ func (cfg *CFG) linkPhiOperandsForBlock(bb *MIRBasicBlock) {
 					valPtr = &v
 				}
 			}
+			// Original operands (position-based, for backward compatibility)
 			phi.operands = append(phi.operands, valPtr)
+			// Record exit stack depth for this predecessor (for stack-polymorphic resolution)
+			// This allows runtime to compute the correct index even if stack depths differ
+			phi.phiPredDepth[parent] = exitDepth
 		}
 	}
 }

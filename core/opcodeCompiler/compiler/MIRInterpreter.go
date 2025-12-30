@@ -2198,40 +2198,55 @@ func mirHandlePHI(it *MIRInterpreter, m *MIR) error {
 		exit := it.prevBB.ExitStack()
 
 		if exit != nil && m.phiStackIndex >= 0 {
-			idxFromTop := m.phiStackIndex
-			if idxFromTop < len(exit) {
-				// Map PHI slot (0=top) to index in exit snapshot
-				src := exit[len(exit)-1-idxFromTop]
-				// Mark as live-in to force evalValue to consult cross-BB results first
-				src.liveIn = true
+			// Use phiPredDepth for stack-polymorphic resolution if available
+			// This handles cases where the predecessor has a different stack depth than expected
+			useDepth := len(exit)
+			if m.phiPredDepth != nil {
+				if linkDepth, ok := m.phiPredDepth[it.prevBB]; ok && linkDepth > 0 {
+					// Use the depth recorded at link time for this predecessor
+					// This ensures we get the correct stack position even if depths differ
+					useDepth = linkDepth
+				}
+			}
 
-				val := it.evalValue(&src)
-				it.setResult(m, val)
-				// Record PHI result with predecessor sensitivity for future uses
-				if m != nil {
-					if it.phiResults[m] == nil {
-						it.phiResults[m] = make(map[*MIRBasicBlock]*uint256.Int)
-					}
-					if val != nil {
-						it.phiResults[m][it.prevBB] = new(uint256.Int).Set(val)
-						it.phiLastPred[m] = it.prevBB
-						// Signature caches
-						if m.evmPC != 0 {
-							if it.phiResultsBySig[uint64(m.evmPC)] == nil {
-								it.phiResultsBySig[uint64(m.evmPC)] = make(map[int]map[*MIRBasicBlock]*uint256.Int)
+			idxFromTop := m.phiStackIndex
+			if idxFromTop < useDepth && idxFromTop < len(exit) {
+				// Map PHI slot (0=top) to index in exit snapshot
+				// Use useDepth to calculate the base, but bound by actual exit length
+				pos := useDepth - 1 - idxFromTop
+				if pos >= 0 && pos < len(exit) {
+					src := exit[pos]
+					// Mark as live-in to force evalValue to consult cross-BB results first
+					src.liveIn = true
+
+					val := it.evalValue(&src)
+					it.setResult(m, val)
+					// Record PHI result with predecessor sensitivity for future uses
+					if m != nil {
+						if it.phiResults[m] == nil {
+							it.phiResults[m] = make(map[*MIRBasicBlock]*uint256.Int)
+						}
+						if val != nil {
+							it.phiResults[m][it.prevBB] = new(uint256.Int).Set(val)
+							it.phiLastPred[m] = it.prevBB
+							// Signature caches
+							if m.evmPC != 0 {
+								if it.phiResultsBySig[uint64(m.evmPC)] == nil {
+									it.phiResultsBySig[uint64(m.evmPC)] = make(map[int]map[*MIRBasicBlock]*uint256.Int)
+								}
+								if it.phiResultsBySig[uint64(m.evmPC)][m.idx] == nil {
+									it.phiResultsBySig[uint64(m.evmPC)][m.idx] = make(map[*MIRBasicBlock]*uint256.Int)
+								}
+								it.phiResultsBySig[uint64(m.evmPC)][m.idx][it.prevBB] = new(uint256.Int).Set(val)
+								if it.phiLastPredBySig[uint64(m.evmPC)] == nil {
+									it.phiLastPredBySig[uint64(m.evmPC)] = make(map[int]*MIRBasicBlock)
+								}
+								it.phiLastPredBySig[uint64(m.evmPC)][m.idx] = it.prevBB
 							}
-							if it.phiResultsBySig[uint64(m.evmPC)][m.idx] == nil {
-								it.phiResultsBySig[uint64(m.evmPC)][m.idx] = make(map[*MIRBasicBlock]*uint256.Int)
-							}
-							it.phiResultsBySig[uint64(m.evmPC)][m.idx][it.prevBB] = new(uint256.Int).Set(val)
-							if it.phiLastPredBySig[uint64(m.evmPC)] == nil {
-								it.phiLastPredBySig[uint64(m.evmPC)] = make(map[int]*MIRBasicBlock)
-							}
-							it.phiLastPredBySig[uint64(m.evmPC)][m.idx] = it.prevBB
 						}
 					}
+					return nil
 				}
-				return nil
 			}
 		}
 		// Try incoming stacks as fallback before operand selection

@@ -703,7 +703,7 @@ func (evm *EVM) create(caller common.Address, code []byte, gas uint64, value *ui
 
 	// Explicitly set the code to a null hash to prevent caching of jump analysis
 	// for the initialization code.
-	contract.SetCallCode(common.Hash{}, code)
+	contract.SetCallCode(&address, common.Hash{}, code)
 	contract.IsDeployment = true
 
 	ret, err = evm.initNewContract(contract, address)

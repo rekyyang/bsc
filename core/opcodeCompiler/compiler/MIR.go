@@ -122,6 +122,10 @@ type MIR struct {
 	aux *MIR
 	// For PHI nodes only: the stack slot index this PHI represents (0 = top of stack)
 	phiStackIndex int
+	// For PHI nodes only: predecessor block -> exit stack depth at link time
+	// This maps each valid predecessor to its exit stack depth when PHI was linked,
+	// allowing stack-polymorphic PHI resolution by computing the correct index at runtime
+	phiPredDepth map[*MIRBasicBlock]int
 	// Pre-encoded operand info to avoid runtime eval
 	opKinds       []byte         // 0=const,1=def,2=fallback
 	opConst       []*uint256.Int // if const
