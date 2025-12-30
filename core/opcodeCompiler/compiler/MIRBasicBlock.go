@@ -1,6 +1,8 @@
 package compiler
 
 import (
+	"sort"
+
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/holiman/uint256"
 )
@@ -135,6 +137,20 @@ func (b *MIRBasicBlock) SetInitDepthMax(d int) {
 
 func (b *MIRBasicBlock) Parents() []*MIRBasicBlock {
 	return b.parents
+}
+
+// SortedParents returns parents sorted by FirstPC for deterministic ordering.
+// This ensures PHI operand order is consistent regardless of discovery order.
+func (b *MIRBasicBlock) SortedParents() []*MIRBasicBlock {
+	if len(b.parents) <= 1 {
+		return b.parents
+	}
+	sorted := make([]*MIRBasicBlock, len(b.parents))
+	copy(sorted, b.parents)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].FirstPC() < sorted[j].FirstPC()
+	})
+	return sorted
 }
 
 func (b *MIRBasicBlock) SetParents(parents []*MIRBasicBlock) {

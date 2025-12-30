@@ -360,112 +360,198 @@ func (c *CFG) reachEndBB() {
 // (Redundant implementation removed)
 // func (c *CFG) preScanBlocks() { ... }
 
-// GenerateMIRCFG generates a MIR Control Flow Graph for the given bytecode
-func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
-	if len(code) == 0 {
-		return nil, fmt.Errorf("empty code")
+// ==================== Core PHI Operations ====================
+
+// linkPhiOperandsForBlock links PHI operands for a single block.
+// Uses SortedParents() for deterministic ordering.
+// This function is idempotent - it clears existing operands before relinking.
+func (cfg *CFG) linkPhiOperandsForBlock(bb *MIRBasicBlock) {
+	if len(bb.Parents()) == 0 {
+		return
 	}
 
-	cfg := NewCFG(hash, code)
-
-	// memoryAccessor is instance local at runtime
-	var memoryAccessor *MemoryAccessor = cfg.getMemoryAccessor()
-	// stateAccessor is global but we analyze it in processor granularity
-	var stateAccessor *StateAccessor = cfg.getStateAccessor()
-
-	// generate CFG.
-	// Phase 1, Pass 1: Discovery
-	cfg.preScanBlocks()
-
-	// Phase 1, Pass 2: Stack Height Analysis
-	heights, err := cfg.analyzeStackHeights()
-	if err != nil {
-
-		return nil, fmt.Errorf("stack analysis failed: %w", err)
-	}
-
-	// Phase 1, Pass 3: MIR Generation
-	// Use a worklist to robustly discover all reachable blocks, including those missed by static analysis.
-
-	// Initialize queue with statically reachable blocks
-	// Scheme A: use getAllCanonicalBlocks() instead of pcToBlock
-	canonicalBlocks := cfg.getAllCanonicalBlocks()
-	queue := make([]*MIRBasicBlock, 0, len(canonicalBlocks))
-	inQueue := make(map[*MIRBasicBlock]bool)
-
-	// Sort statically reachable blocks for deterministic initial order
-	var initialBlocks []*MIRBasicBlock
-	for _, bb := range canonicalBlocks {
-		if _, ok := heights[bb]; ok {
-			initialBlocks = append(initialBlocks, bb)
+	// Collect PHI instructions
+	phis := make(map[int]*MIR)
+	for _, instr := range bb.Instructions() {
+		if instr.op == MirPHI {
+			phis[instr.phiStackIndex] = instr
 		}
 	}
-	sort.Slice(initialBlocks, func(i, j int) bool {
-		return initialBlocks[i].FirstPC() < initialBlocks[j].FirstPC()
-	})
 
-	for _, bb := range initialBlocks {
-		queue = append(queue, bb)
-		inQueue[bb] = true
+	if len(phis) == 0 {
+		return
 	}
 
-	// Process queue
-	i := 0
-	for i < len(queue) {
-		bb := queue[i]
-		i++
+	// Clear existing operands (idempotent)
+	for _, phi := range phis {
+		phi.operands = nil
+	}
 
-		if bb.built {
+	// Link operands using sorted parents for determinism
+	sortedParents := bb.SortedParents()
+	for _, parent := range sortedParents {
+		ps := parent.ExitStack()
+		for idx, phi := range phis {
+			var valPtr *Value
+			if ps != nil {
+				pos := len(ps) - 1 - idx
+				if pos >= 0 && pos < len(ps) {
+					val := ps[pos]
+					v := val
+					valPtr = &v
+				}
+			}
+			phi.operands = append(phi.operands, valPtr)
+		}
+	}
+}
+
+// simplifyPhiForBlock simplifies trivial PHIs in a single block.
+// A PHI is trivial if all non-nil operands are equal.
+func (cfg *CFG) simplifyPhiForBlock(bb *MIRBasicBlock) {
+	for _, instr := range bb.Instructions() {
+		if instr.op != MirPHI {
 			continue
 		}
 
-		// If block has no entry stack (missed by static analysis), try to seed from incoming stacks
-		// This handles dynamic jump targets that static analysis couldn't resolve.
-		if bb.EntryStack() == nil {
-			// Check if we have static height from Pass 2
-			_, hasStaticHeight := heights[bb]
-
-			if !hasStaticHeight {
-				// Dynamic block: need to derive height from incoming stacks
-				incoming := bb.IncomingStacks()
-				if len(incoming) > 0 {
-					// Pick the first available stack (deterministic order)
-					var parents []*MIRBasicBlock
-					for p := range incoming {
-						parents = append(parents, p)
-					}
-					sort.Slice(parents, func(i, j int) bool {
-						return parents[i].FirstPC() < parents[j].FirstPC()
-					})
-					parentStack := incoming[parents[0]]
-					heights[bb] = len(parentStack)
-				} else {
-					// Unreachable and no known parents? Skip for now.
-					continue
+		// Collect unique non-nil operands
+		var uniqueOps []*Value
+		for _, op := range instr.operands {
+			if op == nil {
+				continue
+			}
+			isDup := false
+			for _, existing := range uniqueOps {
+				if existing != nil && equalValueForFlow(op, existing) {
+					isDup = true
+					break
 				}
 			}
-		}
-
-		h := heights[bb]
-
-		// Check if block starts with JUMPDEST and emit it first
-		if int(bb.FirstPC()) < len(cfg.rawCode) && ByteCode(cfg.rawCode[bb.FirstPC()]) == JUMPDEST {
-			currentEVMBuildPC = bb.FirstPC()
-			currentEVMBuildOp = byte(JUMPDEST)
-			mir := bb.CreateVoidMIR(MirJUMPDEST)
-			if mir != nil {
-				mir.genStackDepth = h
+			if !isDup {
+				uniqueOps = append(uniqueOps, op)
 			}
 		}
 
-		// Create PHIs for entry stack if not already set.
-		// We always create PHIs here because back-edges (loops) may add more parents later.
-		// Trivial PHIs (single operand) will be simplified in a post-processing pass.
+		// If only one unique non-nil operand, simplify PHI
+		if len(uniqueOps) == 1 && uniqueOps[0] != nil {
+			instr.operands = []*Value{uniqueOps[0]}
+		}
+	}
+}
+
+// resolvePhiJumpTargets resolves PHI-based JUMP/JUMPI targets for a block.
+// Returns newly discovered target PCs that need to be built.
+func (cfg *CFG) resolvePhiJumpTargets(bb *MIRBasicBlock) []uint64 {
+	instrs := bb.Instructions()
+	if len(instrs) == 0 {
+		return nil
+	}
+
+	lastInst := instrs[len(instrs)-1]
+	if lastInst.op != MirJUMP && lastInst.op != MirJUMPI {
+		return nil
+	}
+
+	// Skip if already has children (resolved during build)
+	if len(bb.Children()) > 0 {
+		return nil
+	}
+
+	// Check if JUMP target is PHI-based
+	if len(lastInst.operands) == 0 || lastInst.operands[0] == nil {
+		return nil
+	}
+
+	d := lastInst.operands[0]
+	if d.kind != Variable || d.def == nil || d.def.op != MirPHI {
+		return nil
+	}
+
+	// Collect constant targets from PHI chain
+	targetSet := make(map[uint64]bool)
+	visited := make(map[*MIR]bool)
+
+	var collectTargets func(*Value, int)
+	collectTargets = func(v *Value, depth int) {
+		if v == nil || depth > 32 {
+			return
+		}
+		if v.kind == Konst {
+			if v.payload != nil {
+				var tpc uint64
+				for _, b := range v.payload {
+					tpc = (tpc << 8) | uint64(b)
+				}
+				targetSet[tpc] = true
+			} else if v.u != nil {
+				u, _ := v.u.Uint64WithOverflow()
+				targetSet[u] = true
+			}
+			return
+		}
+		if v.kind == Variable && v.def != nil {
+			if visited[v.def] {
+				return
+			}
+			visited[v.def] = true
+			if v.def.op == MirPHI {
+				for _, op := range v.def.operands {
+					collectTargets(op, depth+1)
+				}
+			} else {
+				if tpc, ok := tryResolveUint64ConstPC(v, 16); ok {
+					targetSet[tpc] = true
+				}
+			}
+			return
+		}
+	}
+
+	// Start from PHI operands
+	for _, op := range d.def.operands {
+		collectTargets(op, 0)
+	}
+
+	// Return discovered targets
+	var targets []uint64
+	for tpc := range targetSet {
+		targets = append(targets, tpc)
+	}
+	return targets
+}
+
+// buildUnbuiltBlocks builds all blocks that have incoming stacks but aren't built yet.
+// Returns the number of blocks built.
+func (cfg *CFG) buildUnbuiltBlocks(memoryAccessor *MemoryAccessor, stateAccessor *StateAccessor) int {
+	built := 0
+
+	var blocks []*MIRBasicBlock
+	for _, bb := range cfg.basicBlocks {
+		if bb != nil {
+			blocks = append(blocks, bb)
+		}
+	}
+
+	for _, bb := range blocks {
+		if bb.built {
+			continue
+		}
+		incoming := bb.IncomingStacks()
+		if len(incoming) == 0 {
+			continue
+		}
+
+		// Derive stack height from incoming stacks
+		var h int
+		for _, stack := range incoming {
+			h = len(stack)
+			break
+		}
+
+		// Create entry stack with PHIs if not already set
 		if bb.EntryStack() == nil {
 			entryStack := ValueStack{}
 			for i := 0; i < h; i++ {
-				// Create PHI
-				// phiStackIndex is index FROM TOP: (h-1) - i
 				phi := &MIR{
 					op:            MirPHI,
 					phiStackIndex: h - 1 - i,
@@ -484,33 +570,32 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 			bb.SetEntryStack(entryStack.clone())
 		}
 
-		// Run buildBasicBlock
-		// We pass 'nil' for unprcessedBBs to disable rebuild loop.
-		// buildBasicBlock will use our entryStack and generate MIR.
-		valStack := ValueStack{data: bb.EntryStack()}
-
-		err := cfg.buildBasicBlock(bb, &valStack, memoryAccessor, stateAccessor, nil)
-		if err != nil {
-
-			return nil, fmt.Errorf("build basic block %d failed: %w", bb.blockNum, err)
-		}
-		bb.built = true
-
-		// Enqueue children (successors discovered by buildBasicBlock)
-		for _, child := range bb.Children() {
-			if !child.built && !inQueue[child] {
-				queue = append(queue, child)
-				inQueue[child] = true
+		// Emit JUMPDEST if needed
+		if int(bb.FirstPC()) < len(cfg.rawCode) && ByteCode(cfg.rawCode[bb.FirstPC()]) == JUMPDEST {
+			currentEVMBuildPC = bb.FirstPC()
+			currentEVMBuildOp = byte(JUMPDEST)
+			mir := bb.CreateVoidMIR(MirJUMPDEST)
+			if mir != nil {
+				mir.genStackDepth = h
 			}
 		}
+
+		// Build the block
+		valStack := ValueStack{data: bb.EntryStack()}
+		err := cfg.buildBasicBlock(bb, &valStack, memoryAccessor, stateAccessor, nil)
+		if err != nil {
+			continue
+		}
+		bb.built = true
+		built++
 	}
 
-	// Phase 1, Pass 4: Link PHI Operands
-	// Re-collect ALL built blocks
-	// NOTE: Must use getAllCanonicalBlocks(), NOT basicBlocks. Using basicBlocks includes variant blocks
-	// which share the same PC as canonical blocks. Processing them causes PHI operand
-	// conflicts and test failures (e.g., out of gas errors).
-	// Scheme A: use getAllCanonicalBlocks() instead of pcToBlock
+	return built
+}
+
+// linkAllPhis links PHI operands for all built canonical blocks.
+// Uses SortedParents for deterministic ordering.
+func (cfg *CFG) linkAllPhis() {
 	var bbs []*MIRBasicBlock
 	for _, bb := range cfg.getAllCanonicalBlocks() {
 		if bb.built {
@@ -521,180 +606,52 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 		return bbs[i].FirstPC() < bbs[j].FirstPC()
 	})
 	for _, bb := range bbs {
-		if len(bb.Parents()) == 0 {
-			continue
-		}
+		cfg.linkPhiOperandsForBlock(bb)
+	}
+}
 
-		// Map of PHI index -> PHI instruction
-		phis := make(map[int]*MIR)
-		for _, instr := range bb.Instructions() {
-			if instr.op == MirPHI {
-				phis[instr.phiStackIndex] = instr
-			}
-		}
-
-		if len(phis) == 0 {
-			continue
-		}
-
-		// Clear existing operands to avoid duplication/misalignment from previous builds
-		for _, phi := range phis {
-			phi.operands = nil
-		}
-
-		for _, parent := range bb.Parents() {
-			// Parent must have exit stack
-			ps := parent.ExitStack()
-
-			for idx, phi := range phis {
-				var valPtr *Value
-				if ps != nil {
-					// Stack grows up. index 0 is bottom.
-					// ValueStack data: [bottom ... top]
-					// phiStackIndex (idx) is index FROM TOP (0 = top).
-					// So we want ps[len(ps) - 1 - idx]
-					pos := len(ps) - 1 - idx
-					if pos >= 0 && pos < len(ps) {
-						val := ps[pos]
-						v := val
-						valPtr = &v
-					}
-				}
-				phi.operands = append(phi.operands, valPtr)
-			}
-		}
-
-		// DEBUG: Assert PHI operands count matches Parents count
-		for _, phi := range phis {
-			if len(phi.operands) != len(bb.Parents()) {
-				fmt.Printf("[Pass4 PHI MISMATCH] bb=%d pc=%d phi_idx=%d operands=%d parents=%d\n",
-					bb.blockNum, bb.FirstPC(), phi.phiStackIndex, len(phi.operands), len(bb.Parents()))
-			}
+// simplifyAllPhis simplifies trivial PHIs for all built canonical blocks.
+func (cfg *CFG) simplifyAllPhis() {
+	var bbs []*MIRBasicBlock
+	for _, bb := range cfg.getAllCanonicalBlocks() {
+		if bb.built {
+			bbs = append(bbs, bb)
 		}
 	}
-
-	// Phase 1, Pass 5: Simplify Trivial PHIs
-	// After all PHI operands are linked, simplify PHIs that have only one unique operand.
-	// This handles single-parent blocks where PHI is semantically unnecessary,
-	// allowing JUMP target resolution to trace through to the actual constant values.
 	for _, bb := range bbs {
-		for _, instr := range bb.Instructions() {
-			if instr.op != MirPHI {
-				continue
-			}
-			// Collect unique non-nil operands
-			var uniqueOps []*Value
-			for _, op := range instr.operands {
-				if op == nil {
-					continue
-				}
-				// Check if this operand is already in uniqueOps
-				isDup := false
-				for _, existing := range uniqueOps {
-					if existing != nil && equalValueForFlow(op, existing) {
-						isDup = true
-						break
-					}
-				}
-				if !isDup {
-					uniqueOps = append(uniqueOps, op)
-				}
-			}
-			// If only one unique operand, mark this PHI as trivial
-			// by setting a simplified value that can be traced through
-			if len(uniqueOps) == 1 && uniqueOps[0] != nil {
-				// Replace PHI operands with the single unique value
-				// This allows visitPhi to trace through to the actual value
-				instr.operands = []*Value{uniqueOps[0]}
-			}
+		cfg.simplifyPhiForBlock(bb)
+	}
+}
+
+// resolveAllPhiTargets resolves PHI-based JUMP/JUMPI targets for all built blocks.
+// Returns the number of new targets discovered and connected.
+func (cfg *CFG) resolveAllPhiTargets() int {
+	newTargetsCount := 0
+
+	var bbs []*MIRBasicBlock
+	for _, bb := range cfg.getAllCanonicalBlocks() {
+		if bb.built {
+			bbs = append(bbs, bb)
 		}
 	}
+	sort.Slice(bbs, func(i, j int) bool {
+		return bbs[i].FirstPC() < bbs[j].FirstPC()
+	})
 
-	// Phase 1, Pass 6: Resolve PHI-based JUMP/JUMPI targets
-	// Now that PHI operands are linked and simplified, re-analyze blocks with
-	// PHI-derived JUMP targets to discover their children.
 	for _, bb := range bbs {
-		// Find the last instruction - should be JUMP or JUMPI
-		instrs := bb.Instructions()
-		if len(instrs) == 0 {
-			continue
-		}
-		lastInst := instrs[len(instrs)-1]
-		if lastInst.op != MirJUMP && lastInst.op != MirJUMPI {
-			continue
-		}
-		// Skip if already has children (resolved during build)
-		if len(bb.Children()) > 0 {
-			continue
-		}
-		// Check if JUMP target is PHI-based
-		if len(lastInst.operands) == 0 || lastInst.operands[0] == nil {
-			continue
-		}
-		d := lastInst.operands[0]
-		if d.kind != Variable || d.def == nil || d.def.op != MirPHI {
+		newTargets := cfg.resolvePhiJumpTargets(bb)
+		if len(newTargets) == 0 {
 			continue
 		}
 
-		// Collect constant targets from PHI chain
-		targetSet := make(map[uint64]bool)
-		visited := make(map[*MIR]bool)
-
-		var collectTargets func(*Value, int)
-		collectTargets = func(v *Value, depth int) {
-			if v == nil || depth > 32 {
-				return
-			}
-			if v.kind == Konst {
-				if v.payload != nil {
-					var tpc uint64
-					for _, b := range v.payload {
-						tpc = (tpc << 8) | uint64(b)
-					}
-					targetSet[tpc] = true
-				} else if v.u != nil {
-					u, _ := v.u.Uint64WithOverflow()
-					targetSet[u] = true
-				}
-				return
-			}
-			if v.kind == Variable && v.def != nil {
-				if visited[v.def] {
-					return
-				}
-				visited[v.def] = true
-				if v.def.op == MirPHI {
-					for _, op := range v.def.operands {
-						collectTargets(op, depth+1)
-					}
-				} else {
-					if tpc, ok := tryResolveUint64ConstPC(v, 16); ok {
-						targetSet[tpc] = true
-					}
-				}
-				return
-			}
-		}
-
-		// Start from PHI operands
-		for _, op := range d.def.operands {
-			collectTargets(op, 0)
-		}
-
-		if len(targetSet) == 0 {
-			continue
-		}
-
-		// Build children for valid targets
-		children := make([]*MIRBasicBlock, 0, len(targetSet))
-		for tpc := range targetSet {
+		children := make([]*MIRBasicBlock, 0, len(newTargets))
+		for _, tpc := range newTargets {
 			if tpc >= uint64(len(cfg.rawCode)) {
 				continue
 			}
 			if ByteCode(cfg.rawCode[tpc]) != JUMPDEST {
 				continue
 			}
-			// Scheme A: use getBlockAtPC instead of pcToBlock
 			targetBB := cfg.getBlockAtPC(uint(tpc))
 			if targetBB == nil {
 				continue
@@ -704,7 +661,6 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 
 		if len(children) > 0 {
 			bb.SetChildren(children)
-			// Update parent relationships and set incoming stacks
 			for _, child := range children {
 				existingParents := child.Parents()
 				hasParent := false
@@ -716,8 +672,8 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 				}
 				if !hasParent {
 					child.SetParents(append(existingParents, bb))
+					newTargetsCount++
 				}
-				// Set incoming stack from parent's exit stack
 				if bb.ExitStack() != nil {
 					child.AddIncomingStack(bb, bb.ExitStack())
 				}
@@ -725,96 +681,155 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 		}
 	}
 
-	// Phase 1, Pass 7: Build newly discovered blocks
-	// After Phase 6 resolved PHI-based JUMP targets, some blocks may now have
-	// incoming stacks but weren't built. Build them now.
-	// Iterate until no new blocks are built (handles cascading discoveries).
-	for iteration := 0; iteration < 100; iteration++ { // Safety limit
-		built := 0
+	return newTargetsCount
+}
 
-		// Re-collect all blocks to include any state changes
-		// Use basicBlocks array to get ALL blocks including variants
-		var pass7Blocks []*MIRBasicBlock
-		for _, bb := range cfg.basicBlocks {
-			if bb != nil {
-				pass7Blocks = append(pass7Blocks, bb)
+// ==================== Main CFG Generation ====================
+
+// GenerateMIRCFG generates a MIR Control Flow Graph for the given bytecode
+func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
+	if len(code) == 0 {
+		return nil, fmt.Errorf("empty code")
+	}
+
+	cfg := NewCFG(hash, code)
+
+	// memoryAccessor is instance local at runtime
+	var memoryAccessor *MemoryAccessor = cfg.getMemoryAccessor()
+	// stateAccessor is global but we analyze it in processor granularity
+	var stateAccessor *StateAccessor = cfg.getStateAccessor()
+
+	// Phase 1, Pass 1: Discovery
+	cfg.preScanBlocks()
+
+	// Phase 1, Pass 2: Stack Height Analysis
+	heights, err := cfg.analyzeStackHeights()
+	if err != nil {
+		return nil, fmt.Errorf("stack analysis failed: %w", err)
+	}
+
+	// Phase 2: Initial MIR Generation (worklist-based)
+	// Build statically reachable blocks first
+	canonicalBlocks := cfg.getAllCanonicalBlocks()
+	queue := make([]*MIRBasicBlock, 0, len(canonicalBlocks))
+	inQueue := make(map[*MIRBasicBlock]bool)
+
+	var initialBlocks []*MIRBasicBlock
+	for _, bb := range canonicalBlocks {
+		if _, ok := heights[bb]; ok {
+			initialBlocks = append(initialBlocks, bb)
+		}
+	}
+	sort.Slice(initialBlocks, func(i, j int) bool {
+		return initialBlocks[i].FirstPC() < initialBlocks[j].FirstPC()
+	})
+
+	for _, bb := range initialBlocks {
+		queue = append(queue, bb)
+		inQueue[bb] = true
+	}
+
+	i := 0
+	for i < len(queue) {
+		bb := queue[i]
+		i++
+
+		if bb.built {
+			continue
+		}
+
+		if bb.EntryStack() == nil {
+			_, hasStaticHeight := heights[bb]
+			if !hasStaticHeight {
+				incoming := bb.IncomingStacks()
+				if len(incoming) > 0 {
+					var parents []*MIRBasicBlock
+					for p := range incoming {
+						parents = append(parents, p)
+					}
+					sort.Slice(parents, func(i, j int) bool {
+						return parents[i].FirstPC() < parents[j].FirstPC()
+					})
+					parentStack := incoming[parents[0]]
+					heights[bb] = len(parentStack)
+				} else {
+					continue
+				}
 			}
 		}
 
-		for _, bb := range pass7Blocks {
-			// Skip if already has instructions
-			if len(bb.Instructions()) > 0 {
-				continue
-			}
-			// Skip if no incoming stacks (truly unreachable)
-			incoming := bb.IncomingStacks()
-			if len(incoming) == 0 {
-				continue
-			}
+		h := heights[bb]
 
-			// Derive stack height from incoming stacks
-			var h int
-			for _, stack := range incoming {
-				h = len(stack)
-				break
+		if int(bb.FirstPC()) < len(cfg.rawCode) && ByteCode(cfg.rawCode[bb.FirstPC()]) == JUMPDEST {
+			currentEVMBuildPC = bb.FirstPC()
+			currentEVMBuildOp = byte(JUMPDEST)
+			mir := bb.CreateVoidMIR(MirJUMPDEST)
+			if mir != nil {
+				mir.genStackDepth = h
 			}
+		}
 
-			// Create entry stack with PHIs (same as Phase 3)
-			if bb.EntryStack() == nil {
-				entryStack := ValueStack{}
-				for i := 0; i < h; i++ {
-					phi := &MIR{
-						op:            MirPHI,
-						phiStackIndex: h - 1 - i,
-					}
-					currentEVMBuildPC = bb.FirstPC()
-					currentEVMBuildOp = 0
-					bb.appendMIR(phi)
-
-					val := Value{
-						kind:   Variable,
-						def:    phi,
-						liveIn: true,
-					}
-					entryStack.push(&val)
+		if bb.EntryStack() == nil {
+			entryStack := ValueStack{}
+			for i := 0; i < h; i++ {
+				phi := &MIR{
+					op:            MirPHI,
+					phiStackIndex: h - 1 - i,
 				}
-				bb.SetEntryStack(entryStack.clone())
-			}
-
-			// Check if block starts with JUMPDEST and emit it first
-			if int(bb.FirstPC()) < len(cfg.rawCode) && ByteCode(cfg.rawCode[bb.FirstPC()]) == JUMPDEST {
 				currentEVMBuildPC = bb.FirstPC()
-				currentEVMBuildOp = byte(JUMPDEST)
-				mir := bb.CreateVoidMIR(MirJUMPDEST)
-				if mir != nil {
-					mir.genStackDepth = h
-				}
-			}
+				currentEVMBuildOp = 0
+				bb.appendMIR(phi)
 
-			// Build the block
-			valStack := ValueStack{data: bb.EntryStack()}
-			err := cfg.buildBasicBlock(bb, &valStack, memoryAccessor, stateAccessor, nil)
-			if err != nil {
-				// Log error but continue - some blocks may legitimately fail
-				continue
+				val := Value{
+					kind:   Variable,
+					def:    phi,
+					liveIn: true,
+				}
+				entryStack.push(&val)
 			}
-			bb.built = true
-			built++
+			bb.SetEntryStack(entryStack.clone())
 		}
 
-		// If no new blocks were built, we're done
-		if built == 0 {
+		valStack := ValueStack{data: bb.EntryStack()}
+		err := cfg.buildBasicBlock(bb, &valStack, memoryAccessor, stateAccessor, nil)
+		if err != nil {
+			return nil, fmt.Errorf("build basic block %d failed: %w", bb.blockNum, err)
+		}
+		bb.built = true
+
+		for _, child := range bb.Children() {
+			if !child.built && !inQueue[child] {
+				queue = append(queue, child)
+				inQueue[child] = true
+			}
+		}
+	}
+
+	// Phase 3: Iterative Convergence
+	// Loop: Link PHI → Simplify PHI → Resolve targets → Build new blocks
+	// Until no new blocks are built and no new targets discovered
+	for iteration := 0; iteration < 100; iteration++ {
+		// Step 1: Link PHI operands for all built blocks
+		cfg.linkAllPhis()
+
+		// Step 2: Simplify trivial PHIs
+		cfg.simplifyAllPhis()
+
+		// Step 3: Resolve PHI-based JUMP targets (may discover new targets)
+		newTargets := cfg.resolveAllPhiTargets()
+
+		// Step 4: Build newly discovered blocks
+		built := cfg.buildUnbuiltBlocks(memoryAccessor, stateAccessor)
+
+		// Convergence check: no new work done
+		if built == 0 && newTargets == 0 {
 			break
 		}
 	}
 
-	// Fix entry block (firstPC == 0) to ensure it falls through to PC:2 if it's JUMPDEST
-	// This fixes cases where the entry block should end after PUSH1 and fall through to the loop block
+	// Entry block fix
 	cfg.buildPCIndex()
-	// Always check and fix entry block if PC:2 is JUMPDEST
 	if len(cfg.rawCode) > 2 && ByteCode(cfg.rawCode[2]) == JUMPDEST {
-		// Find the entry block (firstPC == 0)
-		// Scheme A: use getBlockAtPC instead of pcToBlock
 		var entryBB *MIRBasicBlock
 		for _, bb := range cfg.basicBlocks {
 			if bb != nil && bb.FirstPC() == 0 {
@@ -827,14 +842,9 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 		}
 		loopBB := cfg.getBlockAtPC(2)
 		if entryBB != nil && entryBB.FirstPC() == 0 && loopBB != nil {
-			// If entry block has no instructions, rebuild it to ensure it has PUSH1
 			if entryBB.Size() == 0 {
-				// Rebuild the entry block to ensure it has instructions
-				// Reset the block first to clear any stale state
 				entryBB.ResetForRebuild(true)
 				valueStack := ValueStack{}
-				memoryAccessor := cfg.getMemoryAccessor()
-				stateAccessor := cfg.getStateAccessor()
 				unprcessedBBs := MIRBasicBlockStack{}
 				entryBB.built = false
 				entryBB.queued = false
@@ -844,14 +854,11 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 				}
 				entryBB.built = true
 			}
-			// Always fix it - the entry block should always fall through to PC:2 (the loop block)
-			// regardless of what children it currently has
 			children := entryBB.Children()
 			needsFix := false
 			if len(children) == 0 {
 				needsFix = true
 			} else {
-				// Check if any child is not PC:2
 				for _, child := range children {
 					if child == nil || child.FirstPC() != 2 {
 						needsFix = true
@@ -860,13 +867,10 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 				}
 			}
 			if needsFix {
-				// Clear existing children first (SetChildren appends, doesn't replace)
 				entryBB.children = nil
-				entryBB.childrenBitmap = &bitmap{0} // Reset bitmap
-				// Now set the correct child
+				entryBB.childrenBitmap = &bitmap{0}
 				entryBB.SetChildren([]*MIRBasicBlock{loopBB})
-				entryBB.SetLastPC(1) // Entry block ends at PC:1 (after PUSH1 0x03)
-				// Add entry block to loop block's parents (don't replace existing parents)
+				entryBB.SetLastPC(1)
 				existingParents := loopBB.Parents()
 				hasEntryAsParent := false
 				for _, p := range existingParents {
@@ -878,23 +882,20 @@ func GenerateMIRCFG(hash common.Hash, code []byte) (*CFG, error) {
 				if !hasEntryAsParent {
 					loopBB.SetParents(append(existingParents, entryBB))
 				}
-				// Set exit stack and incoming stack
-				// If entry block doesn't have exit stack, create one with the expected stack after PUSH1
 				if entryBB.ExitStack() == nil {
-					// Entry block should have PUSH1 which pushes one value onto stack
-					// Create a simple exit stack with one variable value
 					exitStack := ValueStack{}
 					exitStack.push(&Value{kind: Variable})
 					entryBB.SetExitStack(exitStack.clone())
 				}
 				loopBB.AddIncomingStack(entryBB, entryBB.ExitStack())
-				// Mark entry block as built and not queued to prevent rebuilds
+				// Re-link PHI operands for loopBB after adding new parent
+				cfg.linkPhiOperandsForBlock(loopBB)
 				entryBB.built = true
 				entryBB.queued = false
 			}
 		}
 	}
-	// Debug dump disabled to reduce noise in benchmarks
+
 	return cfg, nil
 }
 
