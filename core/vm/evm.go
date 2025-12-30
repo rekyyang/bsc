@@ -113,6 +113,11 @@ type EVM struct {
 	// the execution of the tx
 	interpreter *EVMInterpreter
 
+	// Optional MIR runner hook. When enabled, the EVM may dispatch top-level
+	// CALL execution to this runner. Nested calls always use the geth
+	// interpreter to preserve semantics and avoid recursion.
+	mirRunner ContractRunner
+
 	// abort is used to abort the EVM calling operations
 	abort atomic.Bool
 
@@ -130,6 +135,22 @@ type EVM struct {
 	// the life cycle of EVM.
 	optInterpreter  *EVMInterpreter
 	baseInterpreter *EVMInterpreter
+}
+
+func (evm *EVM) shouldUseMIR() bool {
+	return evm != nil &&
+		evm.Config.EnableMIR &&
+		evm.mirRunner != nil &&
+		evm.depth == 0
+}
+
+func (evm *EVM) runWithRunner(r ContractRunner, contract *Contract, input []byte, readOnly bool) ([]byte, error) {
+	// Mirror (*EVMInterpreter).Run depth management so nested EVM calls observe the correct depth.
+	evm.depth++
+	defer func() { evm.depth-- }()
+	// Keep contract.Input in sync with interpreter behavior.
+	contract.Input = input
+	return r.Run(contract, input, readOnly)
 }
 
 // NewEVM constructs an EVM instance with the supplied block context, state
@@ -267,7 +288,16 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 		if len(code) == 0 {
 			ret, err = nil, nil // gas is unchanged
 		} else {
-			if evm.Config.EnableOpcodeOptimizations {
+			// Optional MIR dispatch for top-level execution only.
+			if evm.shouldUseMIR() {
+				contract := GetContract(caller, addr, value, gas, evm.jumpDests)
+				defer ReturnContract(contract)
+				contract.IsSystemCall = isSystemCall(caller)
+				// IMPORTANT: run raw code (not optimized/super-instructions), since MIR parses EVM bytecode.
+				contract.SetCallCode(evm.resolveCodeHash(addr), code)
+				ret, err = evm.runWithRunner(evm.mirRunner, contract, input, false)
+				gas = contract.Gas
+			} else if evm.Config.EnableOpcodeOptimizations {
 				// If the account has no code, we can abort here
 				// The depth-check is already done, and precompiles handled above
 				contract := GetContract(caller, addr, value, gas, evm.jumpDests)
