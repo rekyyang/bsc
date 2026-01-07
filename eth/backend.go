@@ -357,6 +357,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 			VmConfig: vm.Config{
 				EnablePreimageRecording:   config.EnablePreimageRecording,
 				EnableOpcodeOptimizations: config.EnableOpcodeOptimizing,
+				EnableMIR:                 config.EnableMIR,
 			},
 		}
 	)
